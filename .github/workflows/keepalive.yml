@@ -1,0 +1,25 @@
+name: keepalive
+
+# The watch workflow keeps its state in the Actions cache, not the repo, so it
+# never commits. GitHub disables scheduled workflows after 60 days without a
+# commit to the default branch, so make one trivial commit a month to stay live.
+on:
+  schedule:
+    - cron: "0 6 1 * *" # 06:00 UTC on the 1st of each month
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git config user.name "pstonn-watchdog"
+          git config user.email "watchdog@users.noreply.github.com"
+          date -u +%FT%TZ > .keepalive
+          git add .keepalive
+          git commit -m "keepalive $(date -u +%F)" || exit 0
+          git push

@@ -5,11 +5,7 @@ on:
     - cron: "*/10 * * * *" # every ~10 min (GitHub cron is best-effort; may be delayed)
   workflow_dispatch: {} # a manual "run it now" button for testing
 
-# Runs write updated state (outage flags, refreshed roster cache) back to the repo.
-permissions:
-  contents: write
-
-# Never let two runs (a delayed one + the next) race on the committed state.
+# Never let two runs (a delayed one + the next) race on the shared state.
 concurrency:
   group: watchdog-state
   cancel-in-progress: false
@@ -20,15 +16,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-go@v5
         with:
-          node-version: "20"
-          cache: npm
+          go-version: "1.22"
 
-      - run: npm ci
+      # State (encrypted roster cache + outage flags) lives in the Actions cache,
+      # NOT in the repo — so user emails are never committed to a public repo, and
+      # the cache is not publicly downloadable. Rotating key + restore-keys prefix
+      # is the standard pattern for mutable state (cache keys are immutable).
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: watchdog-state-${{ github.run_id }}
+          restore-keys: watchdog-state-
+
+      - run: mkdir -p state
 
       - name: Poll and notify
-        run: node watch.mjs
+        run: go run .
         env:
           STATUS_URL: ${{ secrets.STATUS_URL }}
           STATUS_TOKEN: ${{ secrets.STATUS_TOKEN }}
@@ -49,14 +55,9 @@ jobs:
           DOWN_THRESHOLD_MIN: ${{ vars.DOWN_THRESHOLD_MIN }}
           OPERATOR_ALERT_MIN: ${{ vars.OPERATOR_ALERT_MIN }}
 
-      - name: Persist state
-        run: |
-          git config user.name "pstonn-watchdog"
-          git config user.email "watchdog@users.noreply.github.com"
-          git add state
-          if git diff --cached --quiet; then
-            echo "no state change"
-          else
-            git commit -m "state: $(date -u +%FT%TZ)"
-            git push
-          fi
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: watchdog-state-${{ github.run_id }}
