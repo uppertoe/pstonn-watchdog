@@ -5,7 +5,12 @@ on:
     - cron: "*/10 * * * *" # every ~10 min (GitHub cron is best-effort; may be delayed)
   workflow_dispatch: {} # a manual "run it now" button for testing
 
-# Never let two runs (a delayed one + the next) race on the shared state.
+# The run commits state/state.json (the outage timer/flags — no PII) so the
+# escalation clock survives an Actions cache miss.
+permissions:
+  contents: write
+
+# Serialize a delayed run and the next so they don't race on the shared state.
 concurrency:
   group: watchdog-state
   cancel-in-progress: false
@@ -14,24 +19,21 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4 # brings state/state.json from the repo
 
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
 
-      # State (encrypted roster cache + outage flags) lives in the Actions cache,
-      # NOT in the repo — so user emails are never committed to a public repo, and
-      # the cache is not publicly downloadable. Rotating key + restore-keys prefix
-      # is the standard pattern for mutable state (cache keys are immutable).
-      - name: Restore state
+      # roster.enc (the user emails, encrypted) lives ONLY in the Actions cache —
+      # never committed to this public repo. Rotating key + restore-keys prefix is
+      # the standard pattern for mutable cache state (cache keys are immutable).
+      - name: Restore roster cache
         uses: actions/cache/restore@v4
         with:
-          path: state
-          key: watchdog-state-${{ github.run_id }}
-          restore-keys: watchdog-state-
-
-      - run: mkdir -p state
+          path: state/roster.enc
+          key: watchdog-roster-${{ github.run_id }}
+          restore-keys: watchdog-roster-
 
       - name: Poll and notify
         run: go run .
@@ -55,9 +57,24 @@ jobs:
           DOWN_THRESHOLD_MIN: ${{ vars.DOWN_THRESHOLD_MIN }}
           OPERATOR_ALERT_MIN: ${{ vars.OPERATOR_ALERT_MIN }}
 
-      - name: Save state
+      - name: Save roster cache
         if: always()
-        uses: actions/cache/save@v4
+        run: mkdir -p state && [ -f state/roster.enc ] || : > state/roster.enc
+      - uses: actions/cache/save@v4
+        if: always()
         with:
-          path: state
-          key: watchdog-state-${{ github.run_id }}
+          path: state/roster.enc
+          key: watchdog-roster-${{ github.run_id }}
+
+      - name: Persist state (outage timer/flags — no PII)
+        if: always()
+        run: |
+          git config user.name "pstonn-watchdog"
+          git config user.email "watchdog@users.noreply.github.com"
+          git add state/state.json
+          if git diff --cached --quiet; then
+            echo "no state change"
+          else
+            git commit -m "state: $(date -u +%FT%TZ)"
+            git pull --rebase --autostash && git push
+          fi

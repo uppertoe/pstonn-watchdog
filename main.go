@@ -1,14 +1,18 @@
 // Command pstonn-watchdog is an independent dead-man's switch for p.stonn.
 //
-// Every run polls p.stonn's /status endpoint. A healthy poll refreshes a cached
-// (encrypted) copy of the notify roster. If p.stonn is unreachable or its work
-// loop is stalled for long enough, this tells the affected users — from the
+// Every run polls p.stonn's /status endpoint. A poll that returns a roster
+// refreshes a cached (encrypted) copy of it. If p.stonn is unreachable or its
+// work loop is stalled for long enough, this tells the affected users — from the
 // cached roster, since p.stonn itself is the thing that's down — to set their
 // permit directly with the council, and pings the operator sooner.
 //
 // It runs on GitHub Actions (off the p.stonn VPS on purpose) and keeps its state
-// in the repo between runs. Standard library only; no secrets live in the code —
-// everything comes from the workflow env (GitHub Secrets).
+// between runs. Standard library only; no secrets live in the code — everything
+// comes from the workflow env (GitHub Secrets).
+//
+// Key invariant: an outage is only recorded as "handled" once a message actually
+// DELIVERED. A failed send is retried next run rather than silently dropped, so a
+// delivery/config fault can't turn a real outage into a silent missed alarm.
 package main
 
 import (
@@ -16,9 +20,11 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -33,9 +39,9 @@ import (
 // councilPortal is where users are sent to sort their permit out themselves.
 const councilPortal = "https://parkingpermits.stonnington.vic.gov.au/"
 
-// State lives in the GitHub Actions cache (restored/saved by the workflow), NOT in
-// the repo — so the roster (user emails) is never committed to a public repo. It is
-// also AES-256-GCM encrypted at rest as defence in depth.
+// State: state.json (outage flags + timer — no PII) is committed to the repo so
+// the escalation clock survives a cache miss; roster.enc (the user emails) lives
+// ONLY in the Actions cache, gitignored, and is AES-256-GCM encrypted at rest.
 const (
 	stateDir   = "state"
 	stateFile  = "state/state.json"
@@ -54,13 +60,25 @@ type statusResp struct {
 	Roster []rosterEntry `json:"roster"`
 }
 
-// state persists across runs (committed to the repo by the workflow). DownSince
-// is unix millis of the first failure, 0 when healthy.
+// state persists across runs. DownSince is unix millis of the first failure
+// (0 when healthy). The *Notified flags are set ONLY once a message delivered.
 type state struct {
-	DownSince        int64 `json:"down_since"`
-	Notified         bool  `json:"notified"`
-	OperatorNotified bool  `json:"operator_notified"`
+	DownSince           int64 `json:"down_since"`
+	Notified            bool  `json:"notified"`
+	OperatorNotified    bool  `json:"operator_notified"`
+	ConfigErrorNotified bool  `json:"config_error_notified"`
 }
+
+// pollResult classifies a poll so a self-inflicted config fault (a 401 from a
+// rotated token, a 404 from a path change) can't be mistaken for an outage and
+// blasted to users.
+type pollResult int
+
+const (
+	pollHealthy     pollResult = iota // reachable, 200, valid JSON, scheduler running
+	pollOutage                        // unreachable / 5xx / scheduler stalled — a real outage
+	pollConfigError                   // 4xx / unparseable — we can't read status; likely our config
+)
 
 type config struct {
 	statusURL, statusToken string
@@ -90,78 +108,123 @@ func run() error {
 	st := readState()
 	now := time.Now()
 
-	healthy, roster := poll(cfg)
+	result, roster := poll(cfg)
+	if len(roster) > 0 { // W9: never overwrite a good cache with an empty roster
+		cfg.refreshRoster(roster)
+	}
 
-	if healthy {
-		if roster != nil {
-			cfg.refreshRoster(roster)
-		}
-		if st.Notified || st.OperatorNotified {
-			downMin := 0.0
-			if st.DownSince != 0 {
-				downMin = float64(now.UnixMilli()-st.DownSince) / 60000
-			}
+	switch result {
+	case pollHealthy:
+		downMin := sinceMin(st.DownSince, now)
+		st.DownSince = 0
+		st.ConfigErrorNotified = false
+		if st.Notified { // all-clear to users; only clear the flag once it delivered
 			msg := fmt.Sprintf("p.stonn is updating permits again after about %.0f minutes. You don't need to do anything — your schedule has resumed.", downMin)
-			if st.Notified {
-				cfg.broadcastToUsers("p.stonn is back to normal", msg, "default")
-			}
-			if st.OperatorNotified {
-				cfg.notifyOperator("Recovered", msg)
+			if cfg.broadcastToUsers("p.stonn is back to normal", msg, "default") > 0 || len(roster) == 0 {
+				st.Notified = false
 			}
 		}
-		writeState(state{})
+		if st.OperatorNotified {
+			if cfg.notifyOperator("Recovered", fmt.Sprintf("p.stonn is back after about %.0f minutes.", downMin)) {
+				st.OperatorNotified = false
+			}
+		}
+		writeState(st)
 		log.Print("healthy")
+		return nil
+
+	case pollConfigError:
+		// We can't READ /status — probably STATUS_TOKEN/URL drift, not an outage.
+		// Alert the operator once; do NOT alarm users or start the outage clock.
+		log.Print("config error reading /status — not alarming users")
+		if !st.ConfigErrorNotified {
+			if cfg.notifyOperator("Can't read p.stonn /status — check the watchdog config",
+				"The watchdog got a 4xx or unparseable response from /status. This usually means STATUS_TOKEN or STATUS_URL drifted after a p.stonn redeploy — NOT necessarily an outage. Users were NOT alarmed. Please check the watchdog secrets.") {
+				st.ConfigErrorNotified = true
+			}
+		}
+		writeState(st)
 		return nil
 	}
 
-	// Unhealthy: unreachable, non-2xx, or the scheduler is stalled.
+	// pollOutage: unreachable, 5xx, or the scheduler is stalled.
 	if st.DownSince == 0 {
 		st.DownSince = now.UnixMilli()
 	}
-	downMin := float64(now.UnixMilli()-st.DownSince) / 60000
-	log.Printf("unhealthy for %.1f min", downMin)
+	downMin := sinceMin(st.DownSince, now)
+	log.Printf("outage for %.1f min", downMin)
 
 	if !st.OperatorNotified && downMin >= cfg.operatorThresholdMin {
-		cfg.notifyOperator("p.stonn appears down",
-			fmt.Sprintf("p.stonn's /status has been unreachable or stalled for about %.0f minutes. Users will be alerted at %.0f min.", downMin, cfg.userThresholdMin))
-		st.OperatorNotified = true
+		if cfg.notifyOperator("p.stonn appears down",
+			fmt.Sprintf("p.stonn's /status has been unreachable or stalled for about %.0f minutes. Users will be alerted at %.0f min.", downMin, cfg.userThresholdMin)) {
+			st.OperatorNotified = true
+		}
 	}
 	if !st.Notified && downMin >= cfg.userThresholdMin {
-		n := cfg.broadcastToUsers("p.stonn may not be updating your parking permit", outageBody(downMin), "high")
-		cfg.notifyOperator("Users alerted", fmt.Sprintf("Sent the outage notice to %d users.", n))
-		st.Notified = true
+		reached := cfg.broadcastToUsers("p.stonn may not be updating your parking permit", outageBody(downMin), "high")
+		total := len(roster)
+		if total == 0 { // roster may be cache-only; count what's actually cached
+			if r, e := cfg.readRoster(); e == nil {
+				total = len(r)
+			}
+		}
+		if reached > 0 || total == 0 {
+			st.Notified = true // delivered to at least one, or nobody to reach — done
+			cfg.notifyOperator("Users alerted", fmt.Sprintf("Outage notice delivered to %d of %d users.", reached, total))
+		} else {
+			// Reached no one though users exist — keep retrying next run, and make
+			// sure the operator knows the user alarm is not getting through.
+			cfg.notifyOperator("COULD NOT ALERT USERS",
+				fmt.Sprintf("Tried to send the outage notice to %d users but reached none (delivery failing). Will retry.", total))
+		}
 	}
 	writeState(st)
 	return nil
 }
 
-// poll fetches /status and reports whether p.stonn is healthy (reachable AND the
-// work loop is running) plus the roster it returned.
-func poll(cfg config) (healthy bool, roster []rosterEntry) {
+func sinceMin(unixMillis int64, now time.Time) float64 {
+	if unixMillis == 0 {
+		return 0
+	}
+	return float64(now.UnixMilli()-unixMillis) / 60000
+}
+
+// poll fetches /status and classifies the outcome.
+func poll(cfg config) (pollResult, []rosterEntry) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.statusURL, nil)
 	if err != nil {
 		log.Printf("build request: %v", err)
-		return false, nil
+		return pollConfigError, nil
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.statusToken)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("poll failed: %v", err)
-		return false, nil
+		log.Printf("poll unreachable: %v", err)
+		return pollOutage, nil // network/timeout = genuine outage
 	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		log.Printf("status %d", res.StatusCode)
-		return false, nil
+	defer func() { io.Copy(io.Discard, res.Body); res.Body.Close() }()
+
+	switch {
+	case res.StatusCode == http.StatusOK:
+		// fall through to decode
+	case res.StatusCode >= 500:
+		log.Printf("status %d — outage", res.StatusCode)
+		return pollOutage, nil
+	default: // 4xx / 3xx — WE can't read it; treat as our config problem, not an outage
+		log.Printf("status %d — config error", res.StatusCode)
+		return pollConfigError, nil
 	}
 	var sr statusResp
 	if err := json.NewDecoder(res.Body).Decode(&sr); err != nil {
-		log.Printf("decode status: %v", err)
-		return false, nil
+		log.Printf("decode status: %v — config error", err) // 200 but not our JSON (maintenance/proxy page)
+		return pollConfigError, nil
 	}
-	return !sr.Scheduler.Stale, sr.Roster
+	if sr.Scheduler.Stale {
+		return pollOutage, sr.Roster // reachable but the work loop is wedged
+	}
+	return pollHealthy, sr.Roster
 }
 
 func outageBody(downMin float64) string {
@@ -183,22 +246,33 @@ func readState() state {
 	var s state
 	b, err := os.ReadFile(stateFile)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("read state: %v (starting from empty)", err)
+		}
 		return state{}
 	}
-	_ = json.Unmarshal(b, &s)
+	if err := json.Unmarshal(b, &s); err != nil {
+		log.Printf("parse state: %v (starting from empty)", err)
+		return state{}
+	}
 	return s
 }
 
 func writeState(s state) {
 	b, _ := json.MarshalIndent(s, "", "  ")
-	_ = os.WriteFile(stateFile, append(b, '\n'), 0o644)
+	if err := os.WriteFile(stateFile, append(b, '\n'), 0o644); err != nil {
+		log.Printf("write state: %v", err)
+	}
 }
 
-// ---- encrypted roster cache (repo is public, so it must be encrypted) ----
+// ---- encrypted roster cache ----
 
 func (cfg config) refreshRoster(roster []rosterEntry) {
+	if len(roster) == 0 {
+		return // guard: don't clobber a good cache with nothing
+	}
 	// Only rewrite when the content changed: the random nonce makes every
-	// encryption differ, which would otherwise commit on every run.
+	// encryption differ, which would otherwise churn the cache each run.
 	if cur, err := cfg.readRoster(); err == nil && sameRoster(cur, roster) {
 		return
 	}
@@ -212,11 +286,7 @@ func (cfg config) writeRoster(roster []rosterEntry) error {
 	if err != nil {
 		return err
 	}
-	block, err := aes.NewCipher(cfg.rosterKey)
-	if err != nil {
-		return err
-	}
-	gcm, err := cipher.NewGCM(block)
+	gcm, err := cfg.gcm()
 	if err != nil {
 		return err
 	}
@@ -237,11 +307,7 @@ func (cfg config) readRoster() ([]rosterEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	block, err := aes.NewCipher(cfg.rosterKey)
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
+	gcm, err := cfg.gcm()
 	if err != nil {
 		return nil, err
 	}
@@ -257,6 +323,14 @@ func (cfg config) readRoster() ([]rosterEntry, error) {
 	return roster, json.Unmarshal(pt, &roster)
 }
 
+func (cfg config) gcm() (cipher.AEAD, error) {
+	block, err := aes.NewCipher(cfg.rosterKey)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
 func sameRoster(a, b []rosterEntry) bool {
 	ja, _ := json.Marshal(a)
 	jb, _ := json.Marshal(b)
@@ -265,39 +339,58 @@ func sameRoster(a, b []rosterEntry) bool {
 
 // ---- delivery ----
 
+// broadcastToUsers sends to every roster entry and returns how many were REACHED
+// (at least one channel accepted). A reached count of 0 with a non-empty roster
+// means nothing got through — the caller must not mark the outage handled.
 func (cfg config) broadcastToUsers(subject, body, priority string) int {
 	roster, err := cfg.readRoster()
 	if err != nil {
 		log.Printf("read roster: %v", err)
 	}
+	reached := 0
 	for _, r := range roster {
+		ok := false
 		if r.Email != "" {
-			if err := cfg.sendEmail(r.Email, subject, body); err != nil {
-				log.Printf("email %s: %v", r.Email, err)
+			if e := cfg.sendEmail(r.Email, subject, body); e != nil {
+				log.Printf("email %s: %v", r.Email, e)
+			} else {
+				ok = true
 			}
 		}
 		if r.Ntfy != "" {
-			if err := cfg.sendNtfy(r.Ntfy, subject, body, priority); err != nil {
-				log.Printf("ntfy %s: %v", r.Ntfy, err)
+			if e := cfg.sendNtfy(r.Ntfy, subject, body, priority); e != nil {
+				log.Printf("ntfy %s: %v", r.Ntfy, e)
+			} else {
+				ok = true
 			}
 		}
+		if ok {
+			reached++
+		}
 	}
-	log.Printf("notified %d users", len(roster))
-	return len(roster)
+	log.Printf("reached %d/%d users", reached, len(roster))
+	return reached
 }
 
-func (cfg config) notifyOperator(subject, body string) {
+// notifyOperator returns true if at least one operator channel accepted.
+func (cfg config) notifyOperator(subject, body string) bool {
 	subject = "[p.stonn watchdog] " + subject
+	ok := false
 	if cfg.adminEmail != "" {
-		if err := cfg.sendEmail(cfg.adminEmail, subject, body); err != nil {
-			log.Printf("operator email: %v", err)
+		if e := cfg.sendEmail(cfg.adminEmail, subject, body); e != nil {
+			log.Printf("operator email: %v", e)
+		} else {
+			ok = true
 		}
 	}
 	if cfg.adminTopic != "" {
-		if err := cfg.sendNtfy(cfg.adminTopic, subject, body, "high"); err != nil {
-			log.Printf("operator ntfy: %v", err)
+		if e := cfg.sendNtfy(cfg.adminTopic, subject, body, "high"); e != nil {
+			log.Printf("operator ntfy: %v", e)
+		} else {
+			ok = true
 		}
 	}
+	return ok
 }
 
 // headerValue strips CR/LF so a value can't inject extra email headers.
@@ -307,7 +400,7 @@ func headerValue(s string) string {
 
 func (cfg config) sendEmail(to, subject, body string) error {
 	if cfg.sesHost == "" {
-		return nil // email not configured
+		return errors.New("email channel not configured") // NOT a silent success
 	}
 	msg := strings.Join([]string{
 		"From: " + headerValue(cfg.mailFrom),
@@ -320,7 +413,44 @@ func (cfg config) sendEmail(to, subject, body string) error {
 	}, "\r\n")
 	addr := cfg.sesHost + ":" + cfg.sesPort
 	auth := smtp.PlainAuth("", cfg.sesUser, cfg.sesPass, cfg.sesHost)
-	return smtp.SendMail(addr, auth, senderAddress(cfg.mailFrom), []string{to}, []byte(msg))
+	from := senderAddress(cfg.mailFrom)
+	if cfg.sesPort == "465" { // implicit TLS — smtp.SendMail only does STARTTLS
+		return sendImplicitTLS(addr, cfg.sesHost, auth, from, to, []byte(msg))
+	}
+	return smtp.SendMail(addr, auth, from, []string{to}, []byte(msg))
+}
+
+// sendImplicitTLS handles SMTPS (port 465), which net/smtp.SendMail does not.
+func sendImplicitTLS(addr, host string, auth smtp.Auth, from, to string, msg []byte) error {
+	conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: host})
+	if err != nil {
+		return err
+	}
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if err := c.Auth(auth); err != nil {
+		return err
+	}
+	if err := c.Mail(from); err != nil {
+		return err
+	}
+	if err := c.Rcpt(to); err != nil {
+		return err
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(msg); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return c.Quit()
 }
 
 // senderAddress extracts the bare address from "Name <a@b>".
@@ -335,7 +465,7 @@ func senderAddress(from string) string {
 
 func (cfg config) sendNtfy(topic, title, body, priority string) error {
 	if cfg.ntfyBase == "" || topic == "" {
-		return nil
+		return errors.New("ntfy channel not configured")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -398,6 +528,18 @@ func loadConfig() (config, error) {
 	cfg.sesUser = os.Getenv("SES_USER")
 	cfg.sesPass = os.Getenv("SES_PASS")
 	cfg.mailFrom = strings.TrimSpace(os.Getenv("MAIL_FROM"))
+
+	// A watchdog that can't deliver is worse than none — fail loudly rather than
+	// silently marking outages "handled" while telling no one.
+	if cfg.sesHost == "" && cfg.ntfyBase == "" {
+		return cfg, errors.New("no delivery channel configured: set SES_HOST (+ creds) and/or NTFY_BASE")
+	}
+	if cfg.sesHost != "" && (cfg.sesUser == "" || cfg.sesPass == "" || cfg.mailFrom == "") {
+		return cfg, errors.New("SES_HOST set but SES_USER/SES_PASS/MAIL_FROM missing")
+	}
+	if cfg.adminEmail == "" && cfg.adminTopic == "" {
+		log.Print("warning: no operator alert channel (ADMIN_EMAIL / ADMIN_NTFY_TOPIC) — you won't be told if user delivery fails")
+	}
 	return cfg, nil
 }
 
