@@ -2,5 +2,5 @@
   "down_since": 0,
   "notified": false,
   "operator_notified": false,
-  "config_error_notified": false
+  "config_error_notified": true
 }
