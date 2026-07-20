@@ -59,7 +59,7 @@ jobs:
 
       - name: Save roster cache
         if: always()
-        run: mkdir -p state && [ -f state/roster.enc ] || : > state/roster.enc
+        run: mkdir -p state && touch state/roster.enc
       - uses: actions/cache/save@v4
         if: always()
         with:
