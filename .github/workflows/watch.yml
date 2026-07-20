@@ -1,0 +1,62 @@
+name: watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # every ~10 min (GitHub cron is best-effort; may be delayed)
+  workflow_dispatch: {} # a manual "run it now" button for testing
+
+# Runs write updated state (outage flags, refreshed roster cache) back to the repo.
+permissions:
+  contents: write
+
+# Never let two runs (a delayed one + the next) race on the committed state.
+concurrency:
+  group: watchdog-state
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Poll and notify
+        run: node watch.mjs
+        env:
+          STATUS_URL: ${{ secrets.STATUS_URL }}
+          STATUS_TOKEN: ${{ secrets.STATUS_TOKEN }}
+          ROSTER_KEY: ${{ secrets.ROSTER_KEY }}
+          # SES (SMTP)
+          SES_HOST: ${{ secrets.SES_HOST }}
+          SES_PORT: ${{ secrets.SES_PORT }}
+          SES_USER: ${{ secrets.SES_USER }}
+          SES_PASS: ${{ secrets.SES_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          # ntfy (optional)
+          NTFY_BASE: ${{ secrets.NTFY_BASE }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          # operator alerts (faster, technical)
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_NTFY_TOPIC: ${{ secrets.ADMIN_NTFY_TOPIC }}
+          # thresholds (optional; defaults 45 / 10 minutes)
+          DOWN_THRESHOLD_MIN: ${{ vars.DOWN_THRESHOLD_MIN }}
+          OPERATOR_ALERT_MIN: ${{ vars.OPERATOR_ALERT_MIN }}
+
+      - name: Persist state
+        run: |
+          git config user.name "pstonn-watchdog"
+          git config user.email "watchdog@users.noreply.github.com"
+          git add state
+          if git diff --cached --quiet; then
+            echo "no state change"
+          else
+            git commit -m "state: $(date -u +%FT%TZ)"
+            git push
+          fi

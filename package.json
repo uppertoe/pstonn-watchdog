@@ -1,0 +1,14 @@
+{
+  "name": "pstonn-watchdog",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Independent dead-man's switch for p.stonn: polls /status and notifies users if the permit scheduler is down.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "watch": "node watch.mjs"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.14"
+  }
+}
