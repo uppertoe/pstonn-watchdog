@@ -231,10 +231,9 @@ func outageBody(downMin float64) string {
 	return strings.Join([]string{
 		fmt.Sprintf("p.stonn has been unable to update visitor parking permits for about %.0f minutes.", downMin),
 		"",
-		"Your permit may not show the vehicle you scheduled. To be safe, set the vehicle on your",
-		"permit directly with the City of Stonnington:",
+		"Your permit may not show the vehicle you scheduled. To be safe, set the vehicle on your permit directly with the City of Stonnington:",
 		"",
-		"  " + councilPortal,
+		councilPortal,
 		"",
 		"We'll let you know when p.stonn is back to normal. Sorry for the trouble.",
 	}, "\n")
@@ -402,15 +401,28 @@ func (cfg config) sendEmail(to, subject, body string) error {
 	if cfg.sesHost == "" {
 		return errors.New("email channel not configured") // NOT a silent success
 	}
-	msg := strings.Join([]string{
+	// multipart/alternative: the plain text (always shown by text-only clients)
+	// plus a branded HTML part matching the app. Both base64-encoded so long
+	// inline-styled HTML lines can't trip the SMTP line-length limit.
+	var b strings.Builder
+	b.WriteString(strings.Join([]string{
 		"From: " + headerValue(cfg.mailFrom),
 		"To: " + headerValue(to),
 		"Subject: " + headerValue(subject),
 		"MIME-Version: 1.0",
-		"Content-Type: text/plain; charset=UTF-8",
-		"",
-		body,
-	}, "\r\n")
+		`Content-Type: multipart/alternative; boundary="` + emailBoundary + `"`,
+	}, "\r\n"))
+	b.WriteString("\r\n\r\n")
+	b.WriteString("--" + emailBoundary + "\r\n")
+	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+	b.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+	b.WriteString(b64Wrap(body) + "\r\n")
+	b.WriteString("--" + emailBoundary + "\r\n")
+	b.WriteString("Content-Type: text/html; charset=UTF-8\r\n")
+	b.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+	b.WriteString(b64Wrap(htmlDocument(subject, body)) + "\r\n")
+	b.WriteString("--" + emailBoundary + "--\r\n")
+	msg := b.String()
 	addr := cfg.sesHost + ":" + cfg.sesPort
 	auth := smtp.PlainAuth("", cfg.sesUser, cfg.sesPass, cfg.sesHost)
 	from := senderAddress(cfg.mailFrom)
