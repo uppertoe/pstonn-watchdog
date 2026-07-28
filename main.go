@@ -30,6 +30,7 @@ import (
 	"log"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -58,6 +59,12 @@ type statusResp struct {
 		Stale bool `json:"stale"`
 	} `json:"scheduler"`
 	Roster []rosterEntry `json:"roster"`
+	// RosterSealed is the roster encrypted under ROSTER_KEY — the same AES-GCM
+	// construction this program already uses for its own on-disk cache. The app
+	// sends this instead of Roster once ROSTER_KEY is configured there, so a
+	// leaked STATUS_TOKEN no longer hands over every user's email and push topic.
+	// Both shapes are accepted so the app and this watchdog can be updated apart.
+	RosterSealed string `json:"roster_sealed"`
 }
 
 // state persists across runs. DownSince is unix millis of the first failure
@@ -193,7 +200,18 @@ func sinceMin(unixMillis int64, now time.Time) float64 {
 func poll(cfg config) (pollResult, []rosterEntry) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.statusURL, nil)
+	// Ask for the roster explicitly: once the app has a ROSTER_KEY it omits the
+	// roster entirely unless requested, so that its frequent health polls carry
+	// nothing sensitive. Older app versions ignore the parameter and include the
+	// roster regardless, so this is safe to deploy first.
+	pollURL := cfg.statusURL
+	if u, perr := url.Parse(pollURL); perr == nil {
+		q := u.Query()
+		q.Set("roster", "1")
+		u.RawQuery = q.Encode()
+		pollURL = u.String()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
 	if err != nil {
 		log.Printf("build request: %v", err)
 		return pollConfigError, nil
@@ -221,10 +239,21 @@ func poll(cfg config) (pollResult, []rosterEntry) {
 		log.Printf("decode status: %v — config error", err) // 200 but not our JSON (maintenance/proxy page)
 		return pollConfigError, nil
 	}
-	if sr.Scheduler.Stale {
-		return pollOutage, sr.Roster // reachable but the work loop is wedged
+	roster := sr.Roster
+	if sr.RosterSealed != "" {
+		dec, derr := cfg.openSealedRoster(sr.RosterSealed)
+		if derr != nil {
+			// Keep polling on the health signal, but say so loudly: we are now blind
+			// to new users, and would fall back to a stale cache in an outage.
+			log.Printf("decrypt roster: %v — check ROSTER_KEY matches the app's", derr)
+		} else {
+			roster = dec
+		}
 	}
-	return pollHealthy, sr.Roster
+	if sr.Scheduler.Stale {
+		return pollOutage, roster // reachable but the work loop is wedged
+	}
+	return pollHealthy, roster
 }
 
 func outageBody(downMin float64) string {
@@ -320,6 +349,32 @@ func (cfg config) readRoster() ([]rosterEntry, error) {
 	}
 	var roster []rosterEntry
 	return roster, json.Unmarshal(pt, &roster)
+}
+
+// openSealedRoster decrypts the roster the app sent over the wire. Same format as
+// the on-disk cache below: base64(nonce || ciphertext || tag) under ROSTER_KEY.
+func (cfg config) openSealedRoster(sealed string) ([]rosterEntry, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(sealed))
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cfg.gcm()
+	if err != nil {
+		return nil, err
+	}
+	ns := gcm.NonceSize()
+	if len(raw) < ns {
+		return nil, fmt.Errorf("sealed roster too short")
+	}
+	pt, err := gcm.Open(nil, raw[:ns], raw[ns:], nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []rosterEntry
+	if err := json.Unmarshal(pt, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (cfg config) gcm() (cipher.AEAD, error) {
