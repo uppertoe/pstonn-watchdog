@@ -34,11 +34,25 @@ commit so GitHub doesn't auto-disable the schedule after 60 idle days.
 | `/status` reachable + `scheduler.stale = false` | healthy — refresh roster, clear any outage |
 | unreachable / non-2xx / `scheduler.stale = true` | count from first failure |
 | down ≥ `OPERATOR_ALERT_MIN` (default **10 min**) | alert the operator (once) |
-| down ≥ `DOWN_THRESHOLD_MIN` (default **45 min**) | alert users (once), with the council portal link |
-| healthy again after alerting | send an all-clear |
+| down ≥ `DOWN_THRESHOLD_MIN` (default **45 min**) | begin **targeted** user alerts (see below) |
+| down ≥ `BACKSTOP_ALERT_MIN` (default **12 h**) | alert every household still untold (QR codes are dead at the door by then) |
+| healthy again after alerting | send an all-clear to exactly those who were told |
 
 Timed from the **first failure timestamp** (not a tick count), so GitHub's
 best-effort cron jitter can't cause false alarms.
+
+### Who gets told
+
+The roster p.stonn serves covers only accounts that **manage a live permit**,
+and each entry carries `next_change_at` — when that household's schedule next
+requires a permit write, stamped by the app while healthy. During an outage,
+each run alerts only the households whose stamped change has fallen inside the
+outage window (plus a `NOTIFY_LEAD_MIN` lead, default 60 min): a short outage
+bothers exactly whom it hurt, a long one reaches each household roughly as it
+becomes affected. Households with nothing scheduled hear nothing until the
+backstop. Each household is told **once per outage** (tracked in the encrypted
+`notified.enc`, cache-only like the roster), and the all-clear goes only to
+those who were told.
 
 ## Setup
 
@@ -69,6 +83,8 @@ best-effort cron jitter can't cause false alarms.
    ```sh
    gh variable set DOWN_THRESHOLD_MIN --body '45'
    gh variable set OPERATOR_ALERT_MIN --body '10'
+   gh variable set NOTIFY_LEAD_MIN    --body '60'   # warn this far ahead of a due change
+   gh variable set BACKSTOP_ALERT_MIN --body '720'  # tell everyone at this age (< the app's 48h stamp horizon)
    ```
 
 4. **SES must be out of the sandbox** to email real users (verify your domain and

@@ -25,13 +25,17 @@ jobs:
         with:
           go-version: "1.22"
 
-      # roster.enc (the user emails, encrypted) lives ONLY in the Actions cache —
+      # roster.enc (the user emails, encrypted) and notified.enc (who has been
+      # told about the current outage, encrypted) live ONLY in the Actions cache —
       # never committed to this public repo. Rotating key + restore-keys prefix is
       # the standard pattern for mutable cache state (cache keys are immutable).
+      # Losing this cache mid-outage re-notifies at worst; never the reverse.
       - name: Restore roster cache
         uses: actions/cache/restore@v4
         with:
-          path: state/roster.enc
+          path: |
+            state/roster.enc
+            state/notified.enc
           key: watchdog-roster-${{ github.run_id }}
           restore-keys: watchdog-roster-
 
@@ -56,14 +60,19 @@ jobs:
           # thresholds (optional; defaults 45 / 10 minutes)
           DOWN_THRESHOLD_MIN: ${{ vars.DOWN_THRESHOLD_MIN }}
           OPERATOR_ALERT_MIN: ${{ vars.OPERATOR_ALERT_MIN }}
+          # targeting (optional; defaults 60 min lead / 720 min backstop)
+          NOTIFY_LEAD_MIN: ${{ vars.NOTIFY_LEAD_MIN }}
+          BACKSTOP_ALERT_MIN: ${{ vars.BACKSTOP_ALERT_MIN }}
 
       - name: Save roster cache
         if: always()
-        run: mkdir -p state && touch state/roster.enc
+        run: mkdir -p state && touch state/roster.enc state/notified.enc
       - uses: actions/cache/save@v4
         if: always()
         with:
-          path: state/roster.enc
+          path: |
+            state/roster.enc
+            state/notified.enc
           key: watchdog-roster-${{ github.run_id }}
 
       - name: Persist state (outage timer/flags — no PII)

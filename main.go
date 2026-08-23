@@ -35,23 +35,34 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // Melbourne zone data on a bare Actions runner
 )
 
 // councilPortal is where users are sent to sort their permit out themselves.
 const councilPortal = "https://parkingpermits.stonnington.vic.gov.au/"
 
 // State: state.json (outage flags + timer — no PII) is committed to the repo so
-// the escalation clock survives a cache miss; roster.enc (the user emails) lives
-// ONLY in the Actions cache, gitignored, and is AES-256-GCM encrypted at rest.
+// the escalation clock survives a cache miss; roster.enc (the user emails) and
+// notified.enc (who has been told about the CURRENT outage) live ONLY in the
+// Actions cache, gitignored, and are AES-256-GCM encrypted at rest. Losing the
+// cache mid-outage therefore re-notifies at worst — a duplicate email — never
+// the reverse.
 const (
-	stateDir   = "state"
-	stateFile  = "state/state.json"
-	rosterFile = "state/roster.enc"
+	stateDir     = "state"
+	stateFile    = "state/state.json"
+	rosterFile   = "state/roster.enc"
+	notifiedFile = "state/notified.enc"
 )
 
 type rosterEntry struct {
 	Email string `json:"email"`
 	Ntfy  string `json:"ntfy,omitempty"`
+	// NextChangeAt (RFC3339 UTC, may be empty) is when this household's schedule
+	// next requires a permit write, stamped by the app while healthy. It is what
+	// lets an outage warn exactly the households whose change it has actually
+	// cost: an entry with no stamp has nothing due, and hears only from the
+	// long-outage backstop.
+	NextChangeAt string `json:"next_change_at,omitempty"`
 }
 
 type statusResp struct {
@@ -69,11 +80,15 @@ type statusResp struct {
 
 // state persists across runs. DownSince is unix millis of the first failure
 // (0 when healthy). The *Notified flags are set ONLY once a message delivered.
+// WHO has been told lives in notified.enc (it is PII and this file is public);
+// RecoverDownMin carries the outage's length across all-clear retry runs, when
+// DownSince has already been zeroed. (The pre-targeting `notified` bool is gone;
+// an old state.json's copy of it is simply ignored on parse.)
 type state struct {
-	DownSince           int64 `json:"down_since"`
-	Notified            bool  `json:"notified"`
-	OperatorNotified    bool  `json:"operator_notified"`
-	ConfigErrorNotified bool  `json:"config_error_notified"`
+	DownSince           int64   `json:"down_since"`
+	OperatorNotified    bool    `json:"operator_notified"`
+	ConfigErrorNotified bool    `json:"config_error_notified"`
+	RecoverDownMin      float64 `json:"recover_down_min,omitempty"`
 }
 
 // pollResult classifies a poll so a self-inflicted config fault (a 401 from a
@@ -92,6 +107,16 @@ type config struct {
 	rosterKey              []byte
 	userThresholdMin       float64
 	operatorThresholdMin   float64
+	// notifyLeadMin: how far AHEAD of a household's due change to warn them,
+	// once the outage is past userThresholdMin. An hour mirrors the app's own
+	// rollover window — the natural slack a scheduled change already has.
+	notifyLeadMin float64
+	// backstopThresholdMin: when the outage is this old, every household on the
+	// roster is told regardless of schedule — a static-plate household loses
+	// nothing in a short outage, but in a day-long one their guest QR codes are
+	// dead at the kerb and they deserve to hear it. Must stay well inside the
+	// app's 48h NextChangeAt horizon so no missed write can escape both nets.
+	backstopThresholdMin   float64
 	ntfyBase, ntfyToken    string
 	adminEmail, adminTopic string
 	// SES SMTP
@@ -125,11 +150,30 @@ func run() error {
 		downMin := sinceMin(st.DownSince, now)
 		st.DownSince = 0
 		st.ConfigErrorNotified = false
-		if st.Notified { // all-clear to users; only clear the flag once it delivered
-			msg := fmt.Sprintf("p.stonn is updating permits again after about %.0f minutes. You don't need to do anything — your schedule has resumed.", downMin)
-			if cfg.broadcastToUsers("p.stonn is back to normal", msg, "default") > 0 || len(roster) == 0 {
-				st.Notified = false
+		// All-clear goes ONLY to those actually told about the outage (notified.enc),
+		// and each is dropped from the file only once their all-clear DELIVERED —
+		// the leftovers retry next run. RecoverDownMin keeps the outage's length
+		// for those retries, when DownSince is already zero.
+		if told, err := cfg.readNotified(); err == nil && len(told) > 0 {
+			if st.RecoverDownMin == 0 {
+				st.RecoverDownMin = downMin
 			}
+			msg := fmt.Sprintf("p.stonn is updating permits again after about %.0f minutes. You don't need to do anything — your schedule has resumed and QR codes are working.", st.RecoverDownMin)
+			var remaining []rosterEntry
+			for _, r := range told {
+				if !cfg.sendToEntry(r, "p.stonn is back to normal", msg, "default") {
+					remaining = append(remaining, r)
+				}
+			}
+			if werr := cfg.writeNotified(remaining); werr != nil {
+				log.Printf("write notified: %v", werr)
+			}
+			if len(remaining) == 0 {
+				st.RecoverDownMin = 0
+			}
+			log.Printf("all-clear delivered to %d/%d", len(told)-len(remaining), len(told))
+		} else if err == nil {
+			st.RecoverDownMin = 0
 		}
 		if st.OperatorNotified {
 			if cfg.notifyOperator("Recovered", fmt.Sprintf("p.stonn is back after about %.0f minutes.", downMin)) {
@@ -158,35 +202,93 @@ func run() error {
 	if st.DownSince == 0 {
 		st.DownSince = now.UnixMilli()
 	}
+	st.RecoverDownMin = 0 // a fresh outage invalidates any half-delivered all-clear
 	downMin := sinceMin(st.DownSince, now)
 	log.Printf("outage for %.1f min", downMin)
 
 	if !st.OperatorNotified && downMin >= cfg.operatorThresholdMin {
 		if cfg.notifyOperator("p.stonn appears down",
-			fmt.Sprintf("p.stonn's /status has been unreachable or stalled for about %.0f minutes. Users will be alerted at %.0f min.", downMin, cfg.userThresholdMin)) {
+			fmt.Sprintf("p.stonn's /status has been unreachable or stalled for about %.0f minutes. From %.0f min, households are alerted as their scheduled changes fall due; everyone is alerted at %.0f min.", downMin, cfg.userThresholdMin, cfg.backstopThresholdMin)) {
 			st.OperatorNotified = true
 		}
 	}
-	if !st.Notified && downMin >= cfg.userThresholdMin {
-		reached := cfg.broadcastToUsers("p.stonn may not be updating your parking permit", outageBody(downMin), "high")
-		total := len(roster)
-		if total == 0 { // roster may be cache-only; count what's actually cached
+	if downMin >= cfg.userThresholdMin {
+		// Targeted, progressive alerting: each run notifies the households whose
+		// scheduled change has fallen inside the outage (plus a lead), so a short
+		// outage bothers only whom it actually hurt, while a long one reaches each
+		// household roughly as it becomes affected. Past the backstop threshold,
+		// everyone still untold is told (QR codes are dead at the door by then).
+		// Delivery-or-retry per household: an entry joins notified.enc only once a
+		// channel accepted, so failures retry next run.
+		cached := roster
+		if len(cached) == 0 { // roster may be cache-only during the outage
 			if r, e := cfg.readRoster(); e == nil {
-				total = len(r)
+				cached = r
 			}
 		}
-		if reached > 0 || total == 0 {
-			st.Notified = true // delivered to at least one, or nobody to reach — done
-			cfg.notifyOperator("Users alerted", fmt.Sprintf("Outage notice delivered to %d of %d users.", reached, total))
-		} else {
-			// Reached no one though users exist — keep retrying next run, and make
-			// sure the operator knows the user alarm is not getting through.
-			cfg.notifyOperator("COULD NOT ALERT USERS",
-				fmt.Sprintf("Tried to send the outage notice to %d users but reached none (delivery failing). Will retry.", total))
+		told, err := cfg.readNotified()
+		if err != nil {
+			log.Printf("read notified: %v (treating as none told)", err)
+		}
+		backstop := downMin >= cfg.backstopThresholdMin
+		targets := pickTargets(cached, told, time.UnixMilli(st.DownSince), now,
+			time.Duration(cfg.notifyLeadMin)*time.Minute, backstop)
+		if len(targets) > 0 {
+			reached := 0
+			for _, tg := range targets {
+				subject, body := outageMessage(tg, downMin, backstop)
+				if cfg.sendToEntry(tg, subject, body, "high") {
+					told = append(told, tg)
+					reached++
+				}
+			}
+			if werr := cfg.writeNotified(told); werr != nil {
+				log.Printf("write notified: %v", werr)
+			}
+			if reached > 0 {
+				cfg.notifyOperator("Users alerted", fmt.Sprintf("Outage notice delivered to %d of %d newly affected household(s); %d told in total.", reached, len(targets), len(told)))
+			} else {
+				// Affected households exist and none could be reached — the user
+				// alarm itself is failing, which the operator must know.
+				cfg.notifyOperator("COULD NOT ALERT USERS",
+					fmt.Sprintf("Tried to alert %d affected household(s) but reached none (delivery failing). Will retry.", len(targets)))
+			}
 		}
 	}
 	writeState(st)
 	return nil
+}
+
+// pickTargets selects who to tell about the outage THIS run: roster entries not
+// yet told whose stamped next change falls inside [downStart, now+lead] — their
+// write has been missed or is about to be — or, once backstop is set, everyone
+// still untold. An unparseable stamp counts as affected (fail toward warning);
+// an EMPTY stamp does not (the app healthily reported nothing due), until the
+// backstop sweeps it in.
+func pickTargets(roster, told []rosterEntry, downStart, now time.Time, lead time.Duration, backstop bool) []rosterEntry {
+	toldSet := make(map[string]bool, len(told))
+	for _, r := range told {
+		toldSet[r.Email] = true
+	}
+	var out []rosterEntry
+	for _, r := range roster {
+		if toldSet[r.Email] {
+			continue
+		}
+		include := backstop
+		if !include && r.NextChangeAt != "" {
+			tc, err := time.Parse(time.RFC3339, r.NextChangeAt)
+			if err != nil {
+				include = true
+			} else {
+				include = !tc.Before(downStart) && !tc.After(now.Add(lead))
+			}
+		}
+		if include {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func sinceMin(unixMillis int64, now time.Time) float64 {
@@ -256,16 +358,59 @@ func poll(cfg config) (pollResult, []rosterEntry) {
 	return pollHealthy, roster
 }
 
-func outageBody(downMin float64) string {
-	return strings.Join([]string{
-		fmt.Sprintf("p.stonn has been unable to update visitor parking permits for about %.0f minutes.", downMin),
+// outageMessage composes the per-household outage notice. A household selected
+// for its stamped change gets that change named — the specific, actionable
+// version ("your midnight change was missed; here's the manual fix") that a
+// generic outage blast can't be. The backstop tier (or an unparseable stamp)
+// gets the general version, which is the one that must mention QR codes: by
+// backstop age, dead activation pages at the kerb are the live risk.
+func outageMessage(r rosterEntry, downMin float64, backstop bool) (subject, body string) {
+	// Duration stays vague past two hours (operator preference, 2026-08-23):
+	// "about 13 hours" reads as a catastrophe announcement, and the reader's
+	// action is the same regardless of the number.
+	dur := "some time"
+	if downMin < 120 {
+		dur = fmt.Sprintf("about %.0f minutes", downMin)
+	}
+	if tc, err := time.Parse(time.RFC3339, r.NextChangeAt); err == nil && !backstop {
+		subject = "p.stonn could not make your scheduled permit change"
+		body = strings.Join([]string{
+			"p.stonn has been unable to update visitor parking permits for " + dur + ".",
+			"",
+			"Your schedule had a plate change due around " + tc.In(melbourne()).Format("Mon 2 Jan, 3:04pm") + " — that change has NOT been made, so the permit may still show the previous car.",
+			"",
+			"To be safe, set the vehicle on your permit directly with the City of Stonnington:",
+			"",
+			councilPortal,
+			"",
+			"We'll email you when p.stonn is back to normal. Sorry for the trouble.",
+		}, "\n")
+		return subject, body
+	}
+	subject = "p.stonn is not updating parking permits right now"
+	body = strings.Join([]string{
+		"p.stonn has been unable to update visitor parking permits for " + dur + ", so scheduled plate changes and guest QR codes are not working.",
 		"",
-		"Your permit may not show the vehicle you scheduled. To be safe, set the vehicle on your permit directly with the City of Stonnington:",
+		"If a visitor is parked (or expected), set the vehicle on your permit directly with the City of Stonnington:",
 		"",
 		councilPortal,
 		"",
-		"We'll let you know when p.stonn is back to normal. Sorry for the trouble.",
+		"Printed or shared QR codes won't work until this is resolved — a guest may need you to set their plate at the council site instead.",
+		"",
+		"We'll email you when p.stonn is back to normal. Sorry for the trouble.",
 	}, "\n")
+	return subject, body
+}
+
+// melbourne is the timezone rosters are written in; change times are shown to
+// users in it, never in UTC. The tzdata import keeps this working on a bare
+// Actions runner even without system zone files.
+func melbourne() *time.Location {
+	loc, err := time.LoadLocation("Australia/Melbourne")
+	if err != nil {
+		return time.UTC // degraded but never wrong by more than the label
+	}
+	return loc
 }
 
 // ---- state ----
@@ -310,7 +455,49 @@ func (cfg config) refreshRoster(roster []rosterEntry) {
 }
 
 func (cfg config) writeRoster(roster []rosterEntry) error {
-	pt, err := json.Marshal(roster)
+	return cfg.writeSealedJSON(rosterFile, roster)
+}
+
+func (cfg config) readRoster() ([]rosterEntry, error) {
+	var roster []rosterEntry
+	err := cfg.readSealedJSON(rosterFile, &roster)
+	return roster, err
+}
+
+// readNotified returns who has been told about the current outage. A missing
+// file is simply "no one yet" — the normal healthy state — not an error; so is
+// the empty placeholder the workflow's cache-save `touch` leaves behind.
+func (cfg config) readNotified() ([]rosterEntry, error) {
+	b, err := os.ReadFile(notifiedFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if strings.TrimSpace(string(b)) == "" {
+		return nil, nil
+	}
+	var told []rosterEntry
+	err = cfg.readSealedJSON(notifiedFile, &told)
+	return told, err
+}
+
+// writeNotified records who has been told (full entries, not just emails: the
+// all-clear needs their ntfy topics too). An empty list is written as such —
+// the file's continued presence is harmless and keeps the cache step simple.
+func (cfg config) writeNotified(told []rosterEntry) error {
+	if told == nil {
+		told = []rosterEntry{}
+	}
+	return cfg.writeSealedJSON(notifiedFile, told)
+}
+
+// writeSealedJSON / readSealedJSON are the at-rest encryption for everything
+// this program persists that carries PII: AES-256-GCM under ROSTER_KEY,
+// base64(nonce || ciphertext || tag), one line per file.
+func (cfg config) writeSealedJSON(path string, v any) error {
+	pt, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
@@ -322,33 +509,32 @@ func (cfg config) writeRoster(roster []rosterEntry) error {
 	if _, err := rand.Read(nonce); err != nil {
 		return err
 	}
-	sealed := gcm.Seal(nonce, nonce, pt, nil) // nonce || ciphertext || tag
-	return os.WriteFile(rosterFile, []byte(base64.StdEncoding.EncodeToString(sealed)+"\n"), 0o644)
+	sealed := gcm.Seal(nonce, nonce, pt, nil)
+	return os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(sealed)+"\n"), 0o644)
 }
 
-func (cfg config) readRoster() ([]rosterEntry, error) {
-	b, err := os.ReadFile(rosterFile)
+func (cfg config) readSealedJSON(path string, v any) error {
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(b)))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	gcm, err := cfg.gcm()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	ns := gcm.NonceSize()
 	if len(raw) < ns {
-		return nil, fmt.Errorf("roster cache too short")
+		return fmt.Errorf("%s: sealed file too short", path)
 	}
 	pt, err := gcm.Open(nil, raw[:ns], raw[ns:], nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var roster []rosterEntry
-	return roster, json.Unmarshal(pt, &roster)
+	return json.Unmarshal(pt, v)
 }
 
 // openSealedRoster decrypts the roster the app sent over the wire. Same format as
@@ -393,37 +579,26 @@ func sameRoster(a, b []rosterEntry) bool {
 
 // ---- delivery ----
 
-// broadcastToUsers sends to every roster entry and returns how many were REACHED
-// (at least one channel accepted). A reached count of 0 with a non-empty roster
-// means nothing got through — the caller must not mark the outage handled.
-func (cfg config) broadcastToUsers(subject, body, priority string) int {
-	roster, err := cfg.readRoster()
-	if err != nil {
-		log.Printf("read roster: %v", err)
-	}
-	reached := 0
-	for _, r := range roster {
-		ok := false
-		if r.Email != "" {
-			if e := cfg.sendEmail(r.Email, subject, body); e != nil {
-				log.Printf("email %s: %v", r.Email, e)
-			} else {
-				ok = true
-			}
-		}
-		if r.Ntfy != "" {
-			if e := cfg.sendNtfy(r.Ntfy, subject, body, priority); e != nil {
-				log.Printf("ntfy %s: %v", r.Ntfy, e)
-			} else {
-				ok = true
-			}
-		}
-		if ok {
-			reached++
+// sendToEntry delivers one message to one household on every channel they have,
+// reporting whether at least one channel accepted — the bar for counting them
+// as told (or, on recovery, as given the all-clear).
+func (cfg config) sendToEntry(r rosterEntry, subject, body, priority string) bool {
+	ok := false
+	if r.Email != "" {
+		if e := cfg.sendEmail(r.Email, subject, body); e != nil {
+			log.Printf("email %s: %v", r.Email, e)
+		} else {
+			ok = true
 		}
 	}
-	log.Printf("reached %d/%d users", reached, len(roster))
-	return reached
+	if r.Ntfy != "" {
+		if e := cfg.sendNtfy(r.Ntfy, subject, body, priority); e != nil {
+			log.Printf("ntfy %s: %v", r.Ntfy, e)
+		} else {
+			ok = true
+		}
+	}
+	return ok
 }
 
 // notifyOperator returns true if at least one operator channel accepted.
@@ -586,6 +761,13 @@ func loadConfig() (config, error) {
 	}
 	cfg.userThresholdMin = envFloat("DOWN_THRESHOLD_MIN", 45)
 	cfg.operatorThresholdMin = envFloat("OPERATOR_ALERT_MIN", 10)
+	cfg.notifyLeadMin = envFloat("NOTIFY_LEAD_MIN", 60)
+	cfg.backstopThresholdMin = envFloat("BACKSTOP_ALERT_MIN", 720)
+	if cfg.backstopThresholdMin < cfg.userThresholdMin {
+		// The backstop is the OUTER net; letting it undercut the targeted tier
+		// would turn every blip into a full-roster blast again.
+		cfg.backstopThresholdMin = cfg.userThresholdMin
+	}
 	cfg.ntfyBase = strings.TrimRight(os.Getenv("NTFY_BASE"), "/")
 	cfg.ntfyToken = os.Getenv("NTFY_TOKEN")
 	cfg.adminEmail = strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))
