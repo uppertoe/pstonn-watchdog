@@ -379,7 +379,10 @@ func outageMessage(r rosterEntry, downMin float64, backstop bool) (subject, body
 			"",
 			"Your schedule had a plate change due around " + tc.In(melbourne()).Format("Mon 2 Jan, 3:04pm") + " — that change has NOT been made, so the permit may still show the previous car.",
 			"",
-			"To be safe, set the vehicle on your permit directly with the City of Stonnington:",
+			// Sentence ends with a full stop, not a colon: the HTML alternative
+			// renders the URL block below as an "Open the council portal" button,
+			// and a trailing colon above a button reads as a typo.
+			"To be safe, set the vehicle on your permit directly with the City of Stonnington.",
 			"",
 			councilPortal,
 			"",
@@ -391,7 +394,7 @@ func outageMessage(r rosterEntry, downMin float64, backstop bool) (subject, body
 	body = strings.Join([]string{
 		"p.stonn has been unable to update visitor parking permits for " + dur + ", so scheduled plate changes and guest QR codes are not working.",
 		"",
-		"If a visitor is parked (or expected), set the vehicle on your permit directly with the City of Stonnington:",
+		"If a visitor is parked (or expected), set the vehicle on your permit directly with the City of Stonnington.",
 		"",
 		councilPortal,
 		"",
