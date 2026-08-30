@@ -89,6 +89,10 @@ type state struct {
 	OperatorNotified    bool    `json:"operator_notified"`
 	ConfigErrorNotified bool    `json:"config_error_notified"`
 	RecoverDownMin      float64 `json:"recover_down_min,omitempty"`
+	// Sign-in probe (signin.go): when the anonymous front door first failed, and
+	// whether the operator has been told. Independent of the outage clock.
+	SigninBrokenSince int64 `json:"signin_broken_since,omitempty"`
+	SigninNotified    bool  `json:"signin_notified,omitempty"`
 }
 
 // pollResult classifies a poll so a self-inflicted config fault (a 401 from a
@@ -121,6 +125,15 @@ type config struct {
 	adminEmail, adminTopic string
 	// SES SMTP
 	sesHost, sesPort, sesUser, sesPass, mailFrom string
+	// Sign-in probe (signin.go). signinBase is the app's public origin (derived
+	// from STATUS_URL unless SIGNIN_BASE overrides it); signinAuthHost is the
+	// identity provider a correct Sign in must redirect to — empty disables the
+	// probe. signinAlertMin is how long the front door must stay broken before
+	// the operator is told.
+	signinBase, signinAuthHost string
+	signinAlertMin             float64
+	// operatorHook, when set, replaces the real operator channels (tests).
+	operatorHook func(subject string) bool
 }
 
 func main() {
@@ -180,6 +193,9 @@ func run() error {
 				st.OperatorNotified = false
 			}
 		}
+		// The front door is checked only while /status is healthy: during an
+		// outage it is down for a bigger reason the outage alert already covers.
+		cfg.checkSignin(&st, now)
 		writeState(st)
 		log.Print("healthy")
 		return nil
@@ -606,6 +622,9 @@ func (cfg config) sendToEntry(r rosterEntry, subject, body, priority string) boo
 
 // notifyOperator returns true if at least one operator channel accepted.
 func (cfg config) notifyOperator(subject, body string) bool {
+	if cfg.operatorHook != nil {
+		return cfg.operatorHook(subject)
+	}
 	subject = "[p.stonn watchdog] " + subject
 	ok := false
 	if cfg.adminEmail != "" {
@@ -780,6 +799,15 @@ func loadConfig() (config, error) {
 	cfg.sesUser = os.Getenv("SES_USER")
 	cfg.sesPass = os.Getenv("SES_PASS")
 	cfg.mailFrom = strings.TrimSpace(os.Getenv("MAIL_FROM"))
+	cfg.signinAuthHost = strings.TrimSpace(os.Getenv("SIGNIN_AUTH_HOST"))
+	cfg.signinAlertMin = envFloat("SIGNIN_ALERT_MIN", 10)
+	cfg.signinBase = strings.TrimRight(strings.TrimSpace(os.Getenv("SIGNIN_BASE")), "/")
+	if cfg.signinBase == "" {
+		// STATUS_URL is https://p.<domain>/status; the app's origin is its scheme+host.
+		if u, perr := url.Parse(cfg.statusURL); perr == nil && u.Host != "" {
+			cfg.signinBase = u.Scheme + "://" + u.Host
+		}
+	}
 
 	// A watchdog that can't deliver is worse than none — fail loudly rather than
 	// silently marking outages "handled" while telling no one.

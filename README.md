@@ -41,6 +41,22 @@ commit so GitHub doesn't auto-disable the schedule after 60 idle days.
 Timed from the **first failure timestamp** (not a tick count), so GitHub's
 best-effort cron jitter can't cause false alarms.
 
+### The front door
+
+`/status` says whether the app is up; it says nothing about whether a *new
+visitor* can get in. On 2026-08-28 an edge routing change made the landing
+page's Sign in button loop back to the landing page for two days while every
+health signal stayed green — nobody deploying noticed, because they were already
+signed in. So on every healthy poll the watchdog also acts as an anonymous
+visitor: it loads `/`, finds the Sign in button, follows it **once** without
+following redirects, and requires the first hop to be the login prompt on
+`SIGNIN_AUTH_HOST` (and the same for `/signin` directly). Broken for
+`SIGNIN_ALERT_MIN` (default 10) → the operator is told once, with what the probe
+saw; a recovery notice follows when it passes again. Users are never alerted
+by this probe — scheduled permit changes keep running on the stored council
+session, and there is nothing they could do. Leave `SIGNIN_AUTH_HOST` unset to
+disable the probe.
+
 ### Who gets told
 
 The roster p.stonn serves covers only accounts that **manage a live permit**,
@@ -85,6 +101,8 @@ those who were told.
    gh variable set OPERATOR_ALERT_MIN --body '10'
    gh variable set NOTIFY_LEAD_MIN    --body '60'   # warn this far ahead of a due change
    gh variable set BACKSTOP_ALERT_MIN --body '720'  # tell everyone at this age (< the app's 48h stamp horizon)
+   gh variable set SIGNIN_AUTH_HOST   --body 'auth.example.org'  # enables the sign-in probe
+   gh variable set SIGNIN_ALERT_MIN   --body '10'
    ```
 
 4. **SES must be out of the sandbox** to email real users (verify your domain and

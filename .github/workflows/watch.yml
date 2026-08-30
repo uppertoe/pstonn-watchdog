@@ -63,6 +63,10 @@ jobs:
           # targeting (optional; defaults 60 min lead / 720 min backstop)
           NOTIFY_LEAD_MIN: ${{ vars.NOTIFY_LEAD_MIN }}
           BACKSTOP_ALERT_MIN: ${{ vars.BACKSTOP_ALERT_MIN }}
+          # sign-in probe (optional; empty host disables it): an anonymous visitor
+          # pressing Sign in must reach the login prompt on this host
+          SIGNIN_AUTH_HOST: ${{ vars.SIGNIN_AUTH_HOST }}
+          SIGNIN_ALERT_MIN: ${{ vars.SIGNIN_ALERT_MIN }}
 
       - name: Save roster cache
         if: always()
