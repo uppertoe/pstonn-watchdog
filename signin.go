@@ -71,6 +71,50 @@ func probeSignin(ctx context.Context, client *http.Client, base, authHost string
 			return fmt.Errorf("/signin: %w", err)
 		}
 	}
+	// 4. Representative signed-in-only routes must redirect an anonymous request
+	// to the login prompt too — NOT serve a 200 and not return the app's own
+	// 401 page. The latter is the exact 2026-08 failure: a route renamed in the
+	// app (/council/link -> /tenant/link) but not in the proxy's forward-auth
+	// list fell to the catch-all, got no identity, and 401'd every new user's
+	// council-linking step for days while /signin itself still looked fine. One
+	// route per surface (the link step, an app page) is enough to catch a whole
+	// class of "the proxy route list drifted from the app" bugs.
+	for _, pth := range protectedProbePaths {
+		if err := expectGated(ctx, client, base, pth); err != nil {
+			return fmt.Errorf("protected route %s: %w", pth, err)
+		}
+	}
+	return nil
+}
+
+// protectedProbePaths are signed-in-only routes an anonymous request must never
+// be served. /tenant/link is the council-link step that broke in Aug 2026 (it
+// redirects an anon request to the login prompt); /vehicles is an ordinary app
+// page (it redirects an anon request to the landing page — the shared-link
+// hygiene behaviour). Both are "gated"; the bug returns the app's own 401
+// sign-in page or 200 content instead.
+var protectedProbePaths = []string{"/tenant/link", "/vehicles"}
+
+// expectGated requires an anonymous request to a signed-in-only route to be
+// redirected AWAY (3xx) — whether to the login prompt (@app routes) or to the
+// landing page (@pages routes). The failure this guards against is the route
+// falling through the proxy's forward-auth list to the catch-all: the app then
+// receives no identity and answers 200 (content leak) or, as in Aug 2026, 401
+// with its "sign-in isn't available" page. Any non-redirect fails.
+func expectGated(ctx context.Context, client *http.Client, base, path string) error {
+	_, status, location, err := fetch(ctx, client, base+path)
+	if err != nil {
+		return err
+	}
+	if status == 200 {
+		return fmt.Errorf("served 200 to an anonymous request (content leak or no auth)")
+	}
+	if status < 300 || status > 399 {
+		return fmt.Errorf("status %d (a gated route must redirect an anonymous request away; 401 here means it fell through the proxy's forward-auth list)", status)
+	}
+	if location == "" {
+		return fmt.Errorf("status %d with no Location", status)
+	}
 	return nil
 }
 

@@ -56,21 +56,44 @@ func probe(t *testing.T, srv *httptest.Server) error {
 
 const login = "https://auth.example.org/login?rd=x"
 
+func healthyRoutes() map[string][2]string {
+	// /signin and /tenant/link redirect to the login prompt; /vehicles (a @pages
+	// route) redirects to the landing page — both are "gated".
+	return map[string][2]string{
+		"/signin":      {"302", login},
+		"/tenant/link": {"302", login},
+		"/vehicles":    {"302", "/"},
+	}
+}
+
 func TestSigninProbePassesOnAHealthyFrontDoor(t *testing.T) {
-	srv := fakeEdge(t, "/signin", map[string][2]string{"/signin": {"302", login}})
+	srv := fakeEdge(t, "/signin", healthyRoutes())
 	defer srv.Close()
 	if err := probe(t, srv); err != nil {
 		t.Fatalf("healthy front door failed: %v", err)
 	}
 }
 
+// The Aug 2026 bug: a protected route renamed in the app but not in the proxy's
+// forward-auth list falls to the catch-all and the app 401s it. The probe must
+// catch that even while /signin itself is fine.
+func TestSigninProbeCatchesAProtectedRouteFallingThrough(t *testing.T) {
+	r := healthyRoutes()
+	r["/tenant/link"] = [2]string{"401", ""} // fell to catch-all: app 401, not gated
+	srv := fakeEdge(t, "/signin", r)
+	defer srv.Close()
+	err := probe(t, srv)
+	if err == nil || !strings.Contains(err.Error(), "/tenant/link") {
+		t.Fatalf("protected-route fall-through not caught: %v", err)
+	}
+}
+
 // The 2026-08-28 incident, exactly: the button links to /schedule and the edge
 // bounces anonymous /schedule to the landing page.
 func TestSigninProbeCatchesTheLandingPageLoop(t *testing.T) {
-	srv := fakeEdge(t, "/schedule", map[string][2]string{
-		"/schedule": {"302", "/"},
-		"/signin":   {"302", login},
-	})
+	rt := healthyRoutes()
+	rt["/schedule"] = [2]string{"302", "/"}
+	srv := fakeEdge(t, "/schedule", rt)
 	defer srv.Close()
 	err := probe(t, srv)
 	if err == nil || !strings.Contains(err.Error(), `redirects to "/"`) {
@@ -122,9 +145,11 @@ func TestSigninProbeFailsOnServerError(t *testing.T) {
 // checkSignin: the operator is told once after the alert window, and told again
 // when it recovers; the clock starts at the first failure, not the first alert.
 func TestCheckSigninAlertsOnceThenRecovers(t *testing.T) {
-	broken := fakeEdge(t, "/schedule", map[string][2]string{"/schedule": {"302", "/"}, "/signin": {"302", login}})
+	brokenRoutes := healthyRoutes()
+	brokenRoutes["/schedule"] = [2]string{"302", "/"}
+	broken := fakeEdge(t, "/schedule", brokenRoutes)
 	defer broken.Close()
-	healthy := fakeEdge(t, "/signin", map[string][2]string{"/signin": {"302", login}})
+	healthy := fakeEdge(t, "/signin", healthyRoutes())
 	defer healthy.Close()
 
 	var sent []string
