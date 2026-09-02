@@ -1,5 +1,7 @@
 {
   "down_since": 0,
   "operator_notified": false,
-  "config_error_notified": false
+  "config_error_notified": false,
+  "connector_broken_since": 1788385312561,
+  "connector_state": "upstream_changed"
 }
