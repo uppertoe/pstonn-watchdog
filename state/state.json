@@ -3,5 +3,6 @@
   "operator_notified": false,
   "config_error_notified": false,
   "connector_broken_since": 1788385312561,
-  "connector_state": "upstream_changed"
+  "connector_state": "upstream_changed",
+  "connector_notified": true
 }
