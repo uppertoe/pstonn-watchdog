@@ -1,8 +1,9 @@
 name: keepalive
 
-# The watch workflow keeps its state in the Actions cache, not the repo, so it
-# never commits. GitHub disables scheduled workflows after 60 days without a
-# commit to the default branch, so make one trivial commit a month to stay live.
+# The watch workflow commits state/state.json only when the outage flags CHANGE,
+# so a long healthy stretch produces no commits at all. GitHub disables scheduled
+# workflows after 60 days without a commit to the default branch, so make one
+# trivial commit a month to stay live regardless.
 on:
   schedule:
     - cron: "0 6 1 * *" # 06:00 UTC on the 1st of each month

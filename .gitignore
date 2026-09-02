@@ -1,4 +1,5 @@
 /state/roster.enc
+/state/notified.enc
 /state/last-check
 .env
 /pstonn-watchdog

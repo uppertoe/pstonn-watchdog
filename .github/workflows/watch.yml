@@ -67,6 +67,10 @@ jobs:
           # pressing Sign in must reach the login prompt on this host
           SIGNIN_AUTH_HOST: ${{ vars.SIGNIN_AUTH_HOST }}
           SIGNIN_ALERT_MIN: ${{ vars.SIGNIN_ALERT_MIN }}
+          # council-connector check (optional; default 20 min): how long /status
+          # must keep reporting an alertable council.state before the operator
+          # is told
+          CONNECTOR_ALERT_MIN: ${{ vars.CONNECTOR_ALERT_MIN }}
 
       - name: Save roster cache
         if: always()

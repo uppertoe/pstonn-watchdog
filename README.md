@@ -19,13 +19,21 @@ p.stonn is down), so users are only alarmed after a **sustained** outage.
 
 ## Where state lives
 
-**Not in the repo.** The outage flags and the roster cache live in the **GitHub
-Actions cache** (restored/saved by the workflow), so user emails are never
-committed to a public repo, and the cache isn't publicly downloadable. The roster
-is additionally **AES-256-GCM encrypted** with `ROSTER_KEY` as defence in depth.
+Split by sensitivity:
 
-Because nothing is committed, a monthly `keepalive` workflow makes one trivial
-commit so GitHub doesn't auto-disable the schedule after 60 idle days.
+- **`state/state.json` — committed to the repo** (by the workflow, only when it
+  changes). It holds the outage/probe timers and notified flags — no PII — and
+  committing it means the escalation clock survives an Actions cache miss.
+- **`state/roster.enc` and `state/notified.enc` — Actions cache only**, never
+  committed (both gitignored). They hold user emails/topics — the roster, and
+  who has been told about the current outage — **AES-256-GCM encrypted** with
+  `ROSTER_KEY` as defence in depth on top of the cache not being publicly
+  downloadable. Losing the cache mid-outage re-notifies at worst; never the
+  reverse.
+
+A healthy stretch produces no state commits, so a monthly `keepalive` workflow
+makes one trivial commit regardless, keeping GitHub from auto-disabling the
+schedule after 60 idle days.
 
 ## How it decides
 
@@ -37,6 +45,7 @@ commit so GitHub doesn't auto-disable the schedule after 60 idle days.
 | down ≥ `DOWN_THRESHOLD_MIN` (default **45 min**) | begin **targeted** user alerts (see below) |
 | down ≥ `BACKSTOP_ALERT_MIN` (default **12 h**) | alert every household still untold (QR codes are dead at the door by then) |
 | healthy again after alerting | send an all-clear to exactly those who were told |
+| `council.state` alertable for ≥ `CONNECTOR_ALERT_MIN` (default **20 min**) | alert the operator (once): the app is fine but its council operations aren't |
 
 Timed from the **first failure timestamp** (not a tick count), so GitHub's
 best-effort cron jitter can't cause false alarms.
@@ -56,6 +65,31 @@ saw; a recovery notice follows when it passes again. Users are never alerted
 by this probe — scheduled permit changes keep running on the stored council
 session, and there is nothing they could do. Leave `SIGNIN_AUTH_HOST` unset to
 disable the probe.
+
+### The council side
+
+"Scheduler is alive" and "the scheduler's dependency is usable" are different
+facts: if the council added a CAPTCHA to its login tomorrow, or blocked
+p.stonn's IP, `/status` would stay green while every permit write failed. So
+the app derives a connector state from the **real council operations it
+performs** (keep-warm refreshes, plate reads and writes, logins — production
+traffic is the probe; the watchdog never holds council credentials) and
+publishes it as `council.state` on `/status`. Every healthy poll reads it.
+
+Three states alert, each already breadth- or structure-gated app-side so one
+household's typo'd password or one glitched response can never raise them:
+
+| `council.state` | Meaning |
+|---|---|
+| `auth_failed` | logins rejected across **distinct** households — the portal, not a password |
+| `upstream_changed` | the sign-in page stopped parsing, or repeated responses stopped making sense — the CAPTCHA/portal-upgrade signature |
+| `blocked` | the app's fleet breaker confirmed a shared-edge/IP block |
+
+The state must persist for `CONNECTOR_ALERT_MIN` (default 20 — two to three
+polls) before the operator is told, once, with a recovery notice to follow;
+`healthy` / `idle` / `degraded` / `rate_limited` never alert. Users are never
+alerted by this check — the app's own notifier already tells affected
+households per permit.
 
 ### Who gets told
 
@@ -103,6 +137,7 @@ those who were told.
    gh variable set BACKSTOP_ALERT_MIN --body '720'  # tell everyone at this age (< the app's 48h stamp horizon)
    gh variable set SIGNIN_AUTH_HOST   --body 'auth.example.org'  # enables the sign-in probe
    gh variable set SIGNIN_ALERT_MIN   --body '10'
+   gh variable set CONNECTOR_ALERT_MIN --body '20' # council-connector persistence before alerting
    ```
 
 4. **SES must be out of the sandbox** to email real users (verify your domain and

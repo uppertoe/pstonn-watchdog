@@ -76,6 +76,10 @@ type statusResp struct {
 	// leaked STATUS_TOKEN no longer hands over every user's email and push topic.
 	// Both shapes are accepted so the app and this watchdog can be updated apart.
 	RosterSealed string `json:"roster_sealed"`
+	// Council is the app's connector success clock — the health of its REAL
+	// operations against the council portal (see connector.go). An older app
+	// that doesn't send it decodes to the zero value, which never alerts.
+	Council connectorStatus `json:"council"`
 }
 
 // state persists across runs. DownSince is unix millis of the first failure
@@ -93,6 +97,12 @@ type state struct {
 	// whether the operator has been told. Independent of the outage clock.
 	SigninBrokenSince int64 `json:"signin_broken_since,omitempty"`
 	SigninNotified    bool  `json:"signin_notified,omitempty"`
+	// Council-connector check (connector.go): when /status first reported an
+	// alertable connector state, the latest such state, and whether the operator
+	// has been told. No PII — a state word and a timestamp, safe to commit.
+	ConnectorBrokenSince int64  `json:"connector_broken_since,omitempty"`
+	ConnectorState       string `json:"connector_state,omitempty"`
+	ConnectorNotified    bool   `json:"connector_notified,omitempty"`
 }
 
 // pollResult classifies a poll so a self-inflicted config fault (a 401 from a
@@ -132,6 +142,11 @@ type config struct {
 	// the operator is told.
 	signinBase, signinAuthHost string
 	signinAlertMin             float64
+	// connectorAlertMin: how long /status must keep reporting an alertable
+	// council-connector state before the operator is told (connector.go). At a
+	// ~10-minute poll cadence the default of 20 demands two-to-three consecutive
+	// polls, so a blip that heals between polls never emails anyone.
+	connectorAlertMin float64
 	// operatorHook, when set, replaces the real operator channels (tests).
 	operatorHook func(subject string) bool
 }
@@ -153,7 +168,7 @@ func run() error {
 	st := readState()
 	now := time.Now()
 
-	result, roster := poll(cfg)
+	result, roster, council := poll(cfg)
 	if len(roster) > 0 { // W9: never overwrite a good cache with an empty roster
 		cfg.refreshRoster(roster)
 	}
@@ -193,9 +208,11 @@ func run() error {
 				st.OperatorNotified = false
 			}
 		}
-		// The front door is checked only while /status is healthy: during an
-		// outage it is down for a bigger reason the outage alert already covers.
+		// The front door and the council connector are checked only while /status
+		// is healthy: during an outage both are unreadable/down for a bigger
+		// reason the outage alert already covers.
 		cfg.checkSignin(&st, now)
+		cfg.checkConnector(&st, council, now)
 		writeState(st)
 		log.Print("healthy")
 		return nil
@@ -314,8 +331,9 @@ func sinceMin(unixMillis int64, now time.Time) float64 {
 	return float64(now.UnixMilli()-unixMillis) / 60000
 }
 
-// poll fetches /status and classifies the outcome.
-func poll(cfg config) (pollResult, []rosterEntry) {
+// poll fetches /status and classifies the outcome. The connectorStatus is
+// meaningful only on pollHealthy (it is zero on any other result).
+func poll(cfg config) (pollResult, []rosterEntry, connectorStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	// Ask for the roster explicitly: once the app has a ROSTER_KEY it omits the
@@ -332,13 +350,13 @@ func poll(cfg config) (pollResult, []rosterEntry) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
 	if err != nil {
 		log.Printf("build request: %v", err)
-		return pollConfigError, nil
+		return pollConfigError, nil, connectorStatus{}
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.statusToken)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("poll unreachable: %v", err)
-		return pollOutage, nil // network/timeout = genuine outage
+		return pollOutage, nil, connectorStatus{} // network/timeout = genuine outage
 	}
 	defer func() { io.Copy(io.Discard, res.Body); res.Body.Close() }()
 
@@ -347,15 +365,15 @@ func poll(cfg config) (pollResult, []rosterEntry) {
 		// fall through to decode
 	case res.StatusCode >= 500:
 		log.Printf("status %d — outage", res.StatusCode)
-		return pollOutage, nil
+		return pollOutage, nil, connectorStatus{}
 	default: // 4xx / 3xx — WE can't read it; treat as our config problem, not an outage
 		log.Printf("status %d — config error", res.StatusCode)
-		return pollConfigError, nil
+		return pollConfigError, nil, connectorStatus{}
 	}
 	var sr statusResp
 	if err := json.NewDecoder(res.Body).Decode(&sr); err != nil {
 		log.Printf("decode status: %v — config error", err) // 200 but not our JSON (maintenance/proxy page)
-		return pollConfigError, nil
+		return pollConfigError, nil, connectorStatus{}
 	}
 	roster := sr.Roster
 	if sr.RosterSealed != "" {
@@ -369,9 +387,9 @@ func poll(cfg config) (pollResult, []rosterEntry) {
 		}
 	}
 	if sr.Scheduler.Stale {
-		return pollOutage, roster // reachable but the work loop is wedged
+		return pollOutage, roster, connectorStatus{} // reachable but the work loop is wedged
 	}
-	return pollHealthy, roster
+	return pollHealthy, roster, sr.Council
 }
 
 // outageMessage composes the per-household outage notice. A household selected
@@ -801,6 +819,7 @@ func loadConfig() (config, error) {
 	cfg.mailFrom = strings.TrimSpace(os.Getenv("MAIL_FROM"))
 	cfg.signinAuthHost = strings.TrimSpace(os.Getenv("SIGNIN_AUTH_HOST"))
 	cfg.signinAlertMin = envFloat("SIGNIN_ALERT_MIN", 10)
+	cfg.connectorAlertMin = envFloat("CONNECTOR_ALERT_MIN", 20)
 	cfg.signinBase = strings.TrimRight(strings.TrimSpace(os.Getenv("SIGNIN_BASE")), "/")
 	if cfg.signinBase == "" {
 		// STATUS_URL is https://p.<domain>/status; the app's origin is its scheme+host.
