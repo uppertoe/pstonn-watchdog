@@ -36,9 +36,11 @@ import (
 const signinUserAgent = "pstonn-watchdog/1 (+https://github.com/uppertoe/pstonn-watchdog)"
 
 // signinButtonRe finds the landing page's Sign in control: an anchor whose
-// button text is "Sign in". Deliberately narrow — the probe should fail when
-// the button disappears, not silently probe something else.
-var signinButtonRe = regexp.MustCompile(`(?is)<a\s+href="([^"]+)"[^>]*>\s*<button[^>]*>\s*Sign in\b`)
+// text is "Sign in", either directly (the app styles the link as a button
+// since 2026-09-13) or through a nested <button> (the earlier markup).
+// Deliberately narrow beyond that — the probe should fail when the control
+// disappears, not silently probe something else.
+var signinButtonRe = regexp.MustCompile(`(?is)<a\s+href="([^"]+)"[^>]*>\s*(?:<button[^>]*>\s*)?Sign in\b`)
 
 // probeSignin checks the anonymous sign-in path of the app at base (scheme +
 // host, no trailing slash). authHost is the identity provider's hostname that

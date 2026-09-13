@@ -24,7 +24,7 @@ func fakeEdge(t *testing.T, landingHref string, routes map[string][2]string) *ht
 		if r.URL.Path == "/" {
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte(`<!doctype html><section class="lhero"><h1>Schedule your permit.</h1>
-<a href="` + landingHref + `" hx-boost="false"><button type="button" class="cta">Sign in <svg></svg></button></a></section>`))
+<a href="` + landingHref + `" hx-boost="false" class="btnlike cta">Sign in <svg></svg></a></section>`))
 			return
 		}
 		if rt, ok := routes[r.URL.Path]; ok {
