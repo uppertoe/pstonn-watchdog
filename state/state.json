@@ -1,5 +1,6 @@
 {
   "down_since": 0,
   "operator_notified": false,
-  "config_error_notified": false
+  "config_error_notified": false,
+  "signin_broken_since": 1789284813887
 }
