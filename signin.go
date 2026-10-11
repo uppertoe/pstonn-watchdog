@@ -169,6 +169,54 @@ func fetch(ctx context.Context, client *http.Client, u string) (body []byte, sta
 	return body, resp.StatusCode, resp.Header.Get("Location"), nil
 }
 
+// probeFormPost submits the login prompt's form the way a phone does and
+// requires the prompt to process it rather than refuse it.
+//
+// On 2026-10-11 the identity provider gained a same-origin check on its sign-in
+// posts that treated the literal "Origin: null" as a foreign origin. iPhone
+// Safari, Android Chrome and Android Firefox send exactly that for a
+// navigation POST from a page served with Referrer-Policy: no-referrer, so
+// every phone's sign-in was refused with a 403 for hours. The GET-only probe
+// above stayed green throughout: the landing page, the button and the
+// redirect to the prompt were all fine; only the form post was broken.
+//
+// The post carries a deliberately invalid address, so the prompt answers 400
+// ("Please enter a valid email address") after its origin check and before it
+// stores or mails anything: the probe proves the form is accepted from a phone
+// without creating a code or sending mail. A 403 is the outage shape; anything
+// else is reported as what it is.
+func probeFormPost(ctx context.Context, client *http.Client, loginBase string) error {
+	loginBase = strings.TrimRight(loginBase, "/")
+	form := url.Values{"email": {"pstonn-watchdog-probe"}} // not an address: refused by validation, never mailed
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginBase+"/request", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", signinUserAgent)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "text/html")
+	// The shape a phone sends for a navigation POST under no-referrer.
+	req.Header.Set("Origin", "null")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("form post: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512<<10))
+	switch {
+	case resp.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("form post: the login prompt REFUSED a sign-in form posted the way a phone posts it (403, Origin: null); phones cannot sign in")
+	case resp.StatusCode == http.StatusBadRequest && strings.Contains(string(body), "valid email address"):
+		return nil // processed: the origin check passed and validation ran
+	case resp.StatusCode == http.StatusOK:
+		return nil // processed as far as the code page; also fine
+	}
+	return fmt.Errorf("form post: status %d, want the prompt to process the form (400 for an invalid address)", resp.StatusCode)
+}
+
 // noRedirectClient never follows redirects: the probe judges the FIRST hop.
 func noRedirectClient(timeout time.Duration) *http.Client {
 	return &http.Client{
@@ -189,6 +237,15 @@ func (cfg config) checkSignin(st *state, now time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	err := probeSignin(ctx, noRedirectClient(20*time.Second), cfg.signinBase, cfg.signinAuthHost)
+	if err == nil {
+		// The front door reaches the prompt; now the prompt must accept a form
+		// posted the way a phone posts it (see probeFormPost).
+		promptBase := cfg.signinPromptBase
+		if promptBase == "" {
+			promptBase = "https://" + cfg.signinAuthHost
+		}
+		err = probeFormPost(ctx, noRedirectClient(20*time.Second), promptBase)
+	}
 
 	if err == nil {
 		if st.SigninBrokenSince != 0 {

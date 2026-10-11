@@ -152,8 +152,10 @@ func TestCheckSigninAlertsOnceThenRecovers(t *testing.T) {
 	healthy := fakeEdge(t, "/signin", healthyRoutes())
 	defer healthy.Close()
 
+	prompt := fakePrompt(t, 400, "Please enter a valid email address.")
+	defer prompt.Close()
 	var sent []string
-	cfg := config{signinAuthHost: "auth.example.org", signinAlertMin: 10, ntfyBase: "http://127.0.0.1:1"}
+	cfg := config{signinAuthHost: "auth.example.org", signinAlertMin: 10, ntfyBase: "http://127.0.0.1:1", signinPromptBase: prompt.URL}
 	// Route operator notifications to a capture instead of a real channel.
 	notify := func(subject string) bool { sent = append(sent, subject); return true }
 	cfg.operatorHook = notify
@@ -203,4 +205,66 @@ func TestLiveSigninProbe(t *testing.T) {
 		t.Fatalf("live front door: %v", err)
 	}
 	t.Logf("live front door ok: %s -> login prompt on %s", base, host)
+}
+
+// fakePrompt is the identity provider's login prompt as the form-post probe
+// sees it: it answers a phone-shaped POST /request with the given status.
+func fakePrompt(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/request" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Origin") != "null" || r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+			t.Errorf("probe did not post the phone's header shape: Origin=%q Sec-Fetch-Site=%q", r.Header.Get("Origin"), r.Header.Get("Sec-Fetch-Site"))
+		}
+		if r.Header.Get("User-Agent") != signinUserAgent {
+			t.Errorf("probe did not identify itself: %q", r.Header.Get("User-Agent"))
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+}
+
+func TestFormPostProbePassesWhenThePromptValidatesTheForm(t *testing.T) {
+	srv := fakePrompt(t, 400, "<p>Please enter a valid email address.</p>")
+	defer srv.Close()
+	if err := probeFormPost(context.Background(), noRedirectClient(5*time.Second), srv.URL); err != nil {
+		t.Fatalf("healthy prompt reported broken: %v", err)
+	}
+}
+
+// The 2026-10-11 outage shape: the prompt refuses the phone's post outright.
+func TestFormPostProbeCatchesARefusedPhonePost(t *testing.T) {
+	srv := fakePrompt(t, 403, "This request did not come from the sign-in page")
+	defer srv.Close()
+	err := probeFormPost(context.Background(), noRedirectClient(5*time.Second), srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "REFUSED") {
+		t.Fatalf("refused phone post not caught: %v", err)
+	}
+}
+
+func TestFormPostProbeFailsOnServerError(t *testing.T) {
+	srv := fakePrompt(t, 500, "")
+	defer srv.Close()
+	if err := probeFormPost(context.Background(), noRedirectClient(5*time.Second), srv.URL); err == nil {
+		t.Fatal("500 from the prompt not caught")
+	}
+}
+
+// A refused phone post is an outage even when every GET in the front door is
+// fine: checkSignin must start the clock on it.
+func TestCheckSigninFailsWhenThePromptRefusesPhones(t *testing.T) {
+	healthy := fakeEdge(t, "/signin", healthyRoutes())
+	defer healthy.Close()
+	refusing := fakePrompt(t, 403, "This request did not come from the sign-in page")
+	defer refusing.Close()
+	cfg := config{signinAuthHost: "auth.example.org", signinAlertMin: 10, ntfyBase: "http://127.0.0.1:1", signinBase: healthy.URL, signinPromptBase: refusing.URL}
+	cfg.operatorHook = func(string) bool { return true }
+	st := state{}
+	cfg.checkSignin(&st, time.Now())
+	if st.SigninBrokenSince == 0 {
+		t.Fatal("a prompt that refuses phone posts was reported healthy")
+	}
 }

@@ -59,7 +59,12 @@ health signal stayed green — nobody deploying noticed, because they were alrea
 signed in. So on every healthy poll the watchdog also acts as an anonymous
 visitor: it loads `/`, finds the Sign in button, follows it **once** without
 following redirects, and requires the first hop to be the login prompt on
-`SIGNIN_AUTH_HOST` (and the same for `/signin` directly). Broken for
+`SIGNIN_AUTH_HOST` (and the same for `/signin` directly), and that the login
+prompt on that host accepts a sign-in form posted the way a phone posts it
+(`Origin: null`, as iPhone Safari and Android browsers send under the prompt's
+no-referrer policy; the 2026-10-11 outage refused exactly that while every GET
+stayed green). The probe posts an invalid address, so nothing is stored or
+mailed. Broken for
 `SIGNIN_ALERT_MIN` (default 10) → the operator is told once, with what the probe
 saw; a recovery notice follows when it passes again. Users are never alerted
 by this probe — scheduled permit changes keep running on the stored council

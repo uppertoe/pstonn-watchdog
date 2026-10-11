@@ -142,6 +142,9 @@ type config struct {
 	// the operator is told.
 	signinBase, signinAuthHost string
 	signinAlertMin             float64
+	// signinPromptBase is where the form-post probe posts (signin.go); empty
+	// means https://<signinAuthHost>. Tests point it at a fake prompt.
+	signinPromptBase string
 	// connectorAlertMin: how long /status must keep reporting an alertable
 	// council-connector state before the operator is told (connector.go). At a
 	// ~10-minute poll cadence the default of 20 demands two-to-three consecutive
