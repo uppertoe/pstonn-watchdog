@@ -206,15 +206,19 @@ func probeFormPost(ctx context.Context, client *http.Client, loginBase string) e
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512<<10))
+	text := string(body)
 	switch {
-	case resp.StatusCode == http.StatusForbidden:
+	case resp.StatusCode == http.StatusForbidden && strings.Contains(text, "did not come from the sign-in page"):
 		return fmt.Errorf("form post: the login prompt REFUSED a sign-in form posted the way a phone posts it (403, Origin: null); phones cannot sign in")
-	case resp.StatusCode == http.StatusBadRequest && strings.Contains(string(body), "valid email address"):
+	case resp.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("form post: 403 from something in front of the prompt (not the prompt's own refusal page)")
+	case resp.StatusCode == http.StatusBadRequest && strings.Contains(text, "valid email address"):
 		return nil // processed: the origin check passed and validation ran
-	case resp.StatusCode == http.StatusOK:
-		return nil // processed as far as the code page; also fine
 	}
-	return fmt.Errorf("form post: status %d, want the prompt to process the form (400 for an invalid address)", resp.StatusCode)
+	// The invalid address can never reach the code page, so a 200 here is
+	// something other than the prompt answering (a misrouted host serving a
+	// landing page, say) and must not pass.
+	return fmt.Errorf("form post: status %d, want the prompt's own validation response (400 for an invalid address)", resp.StatusCode)
 }
 
 // noRedirectClient never follows redirects: the probe judges the FIRST hop.
@@ -239,12 +243,15 @@ func (cfg config) checkSignin(st *state, now time.Time) {
 	err := probeSignin(ctx, noRedirectClient(20*time.Second), cfg.signinBase, cfg.signinAuthHost)
 	if err == nil {
 		// The front door reaches the prompt; now the prompt must accept a form
-		// posted the way a phone posts it (see probeFormPost).
+		// posted the way a phone posts it (see probeFormPost). Its own context:
+		// a slow front door must not eat this step's time and report it broken.
 		promptBase := cfg.signinPromptBase
 		if promptBase == "" {
 			promptBase = "https://" + cfg.signinAuthHost
 		}
-		err = probeFormPost(ctx, noRedirectClient(20*time.Second), promptBase)
+		pctx, pcancel := context.WithTimeout(context.Background(), 25*time.Second)
+		err = probeFormPost(pctx, noRedirectClient(20*time.Second), promptBase)
+		pcancel()
 	}
 
 	if err == nil {

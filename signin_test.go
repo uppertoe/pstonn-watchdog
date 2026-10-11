@@ -268,3 +268,23 @@ func TestCheckSigninFailsWhenThePromptRefusesPhones(t *testing.T) {
 		t.Fatal("a prompt that refuses phone posts was reported healthy")
 	}
 }
+
+// A 200 cannot be the prompt validating an invalid address, so it must not
+// pass: a misrouted host serving a landing page would otherwise look healthy.
+func TestFormPostProbeRejectsAnUnexpected200(t *testing.T) {
+	srv := fakePrompt(t, 200, "<h1>Welcome</h1>")
+	defer srv.Close()
+	if err := probeFormPost(context.Background(), noRedirectClient(5*time.Second), srv.URL); err == nil {
+		t.Fatal("a 200 from something other than the prompt passed the probe")
+	}
+}
+
+// A 403 that is not the prompt's own refusal page is reported as such.
+func TestFormPostProbeDistinguishesAForeign403(t *testing.T) {
+	srv := fakePrompt(t, 403, "Forbidden by the edge")
+	defer srv.Close()
+	err := probeFormPost(context.Background(), noRedirectClient(5*time.Second), srv.URL)
+	if err == nil || strings.Contains(err.Error(), "REFUSED") || !strings.Contains(err.Error(), "in front of the prompt") {
+		t.Fatalf("foreign 403 misattributed: %v", err)
+	}
+}
